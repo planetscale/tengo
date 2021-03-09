@@ -192,8 +192,8 @@ func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema, explicitTable
 		WHERE  t.table_schema = ?
 		AND    t.table_type = 'BASE TABLE'`
 	if explicitTable != "" {
-		query = query + `
-			AND    t.table_name = ?`
+		query += `
+		AND    t.table_name = ?`
 		args = append(args, explicitTable)
 	}
 	if err := db.SelectContext(ctx, &rawTables, query, args...); err != nil {
