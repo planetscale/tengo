@@ -1,4 +1,4 @@
-module github.com/skeema/tengo
+module github.com/planetscale/tengo
 
 go 1.14
 
