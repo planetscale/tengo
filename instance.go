@@ -349,7 +349,7 @@ func (instance *Instance) Schemas(onlyNames ...string) ([]*Schema, error) {
 			CharSet:   rawSchema.CharSet,
 			Collation: rawSchema.Collation,
 		}
-		if schemas[n].Tables, err = instance.querySchemaTables(rawSchema.Name); err != nil {
+		if schemas[n].Tables, err = instance.QuerySchemaTables(rawSchema.Name, ""); err != nil {
 			return nil, err
 		}
 		if schemas[n].Routines, err = instance.querySchemaRoutines(rawSchema.Name); err != nil {
@@ -844,7 +844,8 @@ func (instance *Instance) StrictModeCompliant(schemas []*Schema) (bool, error) {
 
 var reExtraOnUpdate = regexp.MustCompile(`(?i)\bon update (current_timestamp(?:\(\d*\))?)`)
 
-func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
+// QuerySchemaTables queries either all tables in a given schema, or for a specific table in that schema
+func (instance *Instance) QuerySchemaTables(schema, explicitTable string) ([]*Table, error) {
 	db, err := instance.Connect("information_schema", "")
 	if err != nil {
 		return nil, err
@@ -871,6 +872,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		CharSet            string         `db:"character_set_name"`
 		CollationIsDefault string         `db:"is_default"`
 	}
+	args := []interface{}{schema}
 	query := `
 		SELECT t.table_name AS table_name, t.table_type AS table_type, t.engine AS engine,
 		       t.auto_increment AS auto_increment, t.table_collation AS table_collation,
@@ -880,7 +882,12 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		JOIN   collations c ON t.table_collation = c.collation_name
 		WHERE  t.table_schema = ?
 		AND    t.table_type = 'BASE TABLE'`
-	if err := db.Select(&rawTables, query, schema); err != nil {
+	if explicitTable != "" {
+		query = query + `
+		AND    t.table_name = ?`
+		args = append(args, explicitTable)
+	}
+	if err := db.Select(&rawTables, query, args...); err != nil {
 		return nil, fmt.Errorf("Error querying information_schema.tables for schema %s: %s", schema, err)
 	}
 	if len(rawTables) == 0 {
