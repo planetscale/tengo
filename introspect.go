@@ -21,8 +21,23 @@ import (
 
 var reExtraOnUpdate = regexp.MustCompile(`(?i)\bon update (current_timestamp(?:\(\d*\))?)`)
 
-func querySchemaTables(ctx context.Context, db *sqlx.DB, schema string, flavor Flavor) ([]*Table, error) {
-	tables, havePartitions, err := queryTablesInSchema(ctx, db, schema, flavor)
+// QuerySchemaTable reads and returns a single, specific table
+func QuerySchemaTable(ctx context.Context, db *sqlx.DB, schema, table string, flavor Flavor) (*Table, error) {
+	if table == "" {
+		return nil, fmt.Errorf("QuerySchemaTable exepects non=empty table name")
+	}
+	tables, err := querySchemaTables(ctx, db, schema, table, flavor)
+	if err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	return tables[0], nil
+}
+
+func querySchemaTables(ctx context.Context, db *sqlx.DB, schema, explicitTable string, flavor Flavor) ([]*Table, error) {
+	tables, havePartitions, err := queryTablesInSchema(ctx, db, schema, explicitTable, flavor)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +168,7 @@ func querySchemaTables(ctx context.Context, db *sqlx.DB, schema string, flavor F
 	return tables, nil
 }
 
-func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor Flavor) ([]*Table, bool, error) {
+func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema, explicitTable string, flavor Flavor) ([]*Table, bool, error) {
 	var rawTables []struct {
 		Name               string         `db:"table_name"`
 		Type               string         `db:"table_type"`
@@ -165,6 +180,7 @@ func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor
 		CharSet            string         `db:"character_set_name"`
 		CollationIsDefault string         `db:"is_default"`
 	}
+	args := []interface{}{schema}
 	query := `
 		SELECT SQL_BUFFER_RESULT
 		       t.table_name AS table_name, t.table_type AS table_type, t.engine AS engine,
@@ -175,7 +191,12 @@ func queryTablesInSchema(ctx context.Context, db *sqlx.DB, schema string, flavor
 		JOIN   information_schema.collations c ON t.table_collation = c.collation_name
 		WHERE  t.table_schema = ?
 		AND    t.table_type = 'BASE TABLE'`
-	if err := db.SelectContext(ctx, &rawTables, query, schema); err != nil {
+	if explicitTable != "" {
+		query += `
+		AND    t.table_name = ?`
+		args = append(args, explicitTable)
+	}
+	if err := db.SelectContext(ctx, &rawTables, query, args...); err != nil {
 		return nil, false, fmt.Errorf("Error querying information_schema.tables for schema %s: %s", schema, err)
 	}
 	if len(rawTables) == 0 {

@@ -420,7 +420,7 @@ func (instance *Instance) Schemas(onlyNames ...string) ([]*Schema, error) {
 		}
 		g, ctx := errgroup.WithContext(context.Background())
 		g.Go(func() (err error) {
-			schemas[n].Tables, err = querySchemaTables(ctx, schemaDB, rawSchema.Name, flavor)
+			schemas[n].Tables, err = querySchemaTables(ctx, schemaDB, rawSchema.Name, "", flavor)
 			return err
 		})
 		g.Go(func() (err error) {
