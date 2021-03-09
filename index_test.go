@@ -165,13 +165,15 @@ func TestIndexRedundantTo(t *testing.T) {
 	}{
 		{0, 1, false},
 		{1, 0, true},
+		{1, 1, true},
 		{2, 0, true},
 		{2, 1, true},
 		{3, 2, true},
 		{3, 1, true},
 		{2, 3, false},
 		{4, 3, false},
-		{4, 1, true},
+		{4, 1, false}, // unique not redundant to larger index with same first cols, due to uniqueness constraint aspect
+		{4, 0, false}, // same as previous, but even when compared to the primary key
 		{1, 4, false},
 		{5, 4, false},
 		{5, 3, true},
@@ -214,12 +216,6 @@ func TestIndexComparisonNil(t *testing.T) {
 	}
 	if !idx1.EqualsIgnoringVisibility(idx1) {
 		t.Error("Expected nil.EqualsIgnoringVisibility(nil) to return true, but it returned false")
-	}
-	if idx1.OnlyVisibilityDiffers(idx2) {
-		t.Error("Expected nil.OnlyVisibilityDiffers(non-nil) to return false, but it returned true")
-	}
-	if idx1.OnlyVisibilityDiffers(idx1) {
-		t.Error("Expected nil.OnlyVisibilityDiffers(nil) to return false, but it returned true")
 	}
 	if idx1.Equivalent(idx2) {
 		t.Error("Expected nil.Equivalent(non-nil) to return false, but it returned true")

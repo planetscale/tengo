@@ -2,6 +2,7 @@ package tengo
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -244,5 +245,233 @@ func (s TengoIntegrationSuite) TestAlterPageCompression(t *testing.T) {
 	refetchedTable = s.GetTable(t, "testing", "actor_in_film")
 	if refetchedTable.CreateOptions != "" {
 		t.Fatalf("Expected refetched table to have create options \"\", instead found %q", refetchedTable.CreateOptions)
+	}
+}
+
+// TestAlterCheckConstraints provides unit test coverage relating to diffs of
+// check constraints.
+func TestAlterCheckConstraints(t *testing.T) {
+	flavor := FlavorMySQL80
+	flavor.Patch = 23
+	mods := StatementModifiers{Flavor: flavor}
+
+	// Test addition of checks
+	tableNoChecks := aTableForFlavor(flavor, 1)
+	tableChecks := aTableForFlavor(flavor, 1)
+	tableChecks.Checks = []*Check{
+		{Name: "alivecheck", Clause: "alive != 0", Enforced: true},
+		{Name: "stringythings", Clause: "ssn <> '000000000'", Enforced: true},
+	}
+	tableChecks.CreateStatement = tableChecks.GeneratedCreateStatement(flavor)
+	td := NewAlterTable(&tableNoChecks, &tableChecks)
+	if len(td.alterClauses) != 2 {
+		t.Errorf("Expected 2 alter clauses, instead found %d", len(td.alterClauses))
+	} else {
+		for _, clause := range td.alterClauses {
+			str := clause.Clause(mods)
+			if _, ok := clause.(AddCheck); !ok || !strings.Contains(str, "ADD CONSTRAINT") {
+				t.Errorf("Found unexpected type %T", clause)
+			}
+		}
+	}
+
+	// Test removal of checks
+	td = NewAlterTable(&tableChecks, &tableNoChecks)
+	if len(td.alterClauses) != 2 {
+		t.Errorf("Expected 2 alter clauses, instead found %d", len(td.alterClauses))
+	} else {
+		for _, clause := range td.alterClauses {
+			if _, ok := clause.(DropCheck); !ok {
+				t.Errorf("Found unexpected type %T", clause)
+			}
+			strMySQL := clause.Clause(mods)
+			strMaria := clause.Clause(StatementModifiers{Flavor: FlavorMariaDB105})
+			if strMySQL == strMaria || !strings.Contains(strMySQL, "DROP CHECK") || !strings.Contains(strMaria, "DROP CONSTRAINT") {
+				t.Errorf("Unexpected clause differences between flavors; found MySQL %q, MariaDB %q", strMySQL, strMaria)
+			}
+		}
+	}
+
+	// Test change in check clause on first check. This should result in 4 clauses:
+	// drop and re-add the first check to modify it, and drop and re-add the second
+	// check but only for ordering (which is typically ignored)
+	tableChecks2 := aTableForFlavor(flavor, 1)
+	tableChecks2.Checks = []*Check{
+		{Name: "alivecheck", Clause: "alive = 1", Enforced: true},
+		{Name: "stringythings", Clause: "ssn <> '000000000'", Enforced: true},
+	}
+	tableChecks2.CreateStatement = tableChecks2.GeneratedCreateStatement(flavor)
+	td = NewAlterTable(&tableChecks, &tableChecks2)
+	if len(td.alterClauses) != 4 {
+		t.Errorf("Expected 4 alterClauses, instead found %d", len(td.alterClauses))
+	} else {
+		if dcc, ok := td.alterClauses[0].(DropCheck); !ok || dcc.Check != tableChecks.Checks[0] || dcc.reorderOnly {
+			t.Errorf("Found unexpected alterClause %+v", td.alterClauses[0])
+		}
+		if acc, ok := td.alterClauses[1].(AddCheck); !ok || acc.Check != tableChecks2.Checks[0] || acc.reorderOnly {
+			t.Errorf("Found unexpected alterClause %+v", td.alterClauses[1])
+		}
+		if dcc, ok := td.alterClauses[2].(DropCheck); !ok || dcc.Check != tableChecks.Checks[1] || !dcc.reorderOnly {
+			t.Errorf("Found unexpected alterClause %+v", td.alterClauses[2])
+		}
+		if acc, ok := td.alterClauses[3].(AddCheck); !ok || acc.Check != tableChecks2.Checks[1] || !acc.reorderOnly {
+			t.Errorf("Found unexpected alterClause %+v", td.alterClauses[3])
+		}
+		for n, alterClause := range td.alterClauses {
+			expectBlank := n > 1
+			actualBlank := alterClause.Clause(mods) == ""
+			if expectBlank != actualBlank {
+				t.Errorf("Unexpected result from Clause() at n=%d", n)
+			}
+		}
+	}
+
+	// Test alteration of check enforcement
+	tableChecks2.Checks = []*Check{
+		{Name: "alivecheck", Clause: "alive != 0", Enforced: true},
+		{Name: "stringythings", Clause: "ssn <> '000000000'", Enforced: false},
+	}
+	tableChecks2.CreateStatement = tableChecks2.GeneratedCreateStatement(flavor)
+	td = NewAlterTable(&tableChecks, &tableChecks2)
+	if len(td.alterClauses) != 1 {
+		t.Errorf("Expected 1 alterClause, instead found %d", len(td.alterClauses))
+	} else {
+		str := td.alterClauses[0].Clause(mods)
+		if _, ok := td.alterClauses[0].(AlterCheck); !ok || !strings.Contains(str, "ALTER CHECK") {
+			t.Errorf("Found unexpected type %T", td.alterClauses[0])
+		}
+	}
+
+	// Create a table with 5 checks. Reorder one of them and confirm result.
+	flavor = FlavorMariaDB105
+	tableChecks, tableChecks2 = aTableForFlavor(flavor, 1), aTableForFlavor(flavor, 1)
+	tableChecks.Checks = []*Check{
+		{Name: "check1", Clause: "ssn <> '111111111'", Enforced: true},
+		{Name: "check2", Clause: "ssn <> '222222222'", Enforced: true},
+		{Name: "check3", Clause: "ssn <> '333333333'", Enforced: true},
+		{Name: "check4", Clause: "ssn <> '444444444'", Enforced: true},
+		{Name: "check5", Clause: "ssn <> '555555555'", Enforced: true},
+	}
+	tableChecks.CreateStatement = tableChecks.GeneratedCreateStatement(flavor)
+	tableChecks2.Checks = []*Check{
+		{Name: "check1", Clause: "ssn <> '111111111'", Enforced: true},
+		{Name: "check2", Clause: "ssn <> '222222222'", Enforced: true},
+		{Name: "check4", Clause: "ssn <> '444444444'", Enforced: true},
+		{Name: "check3", Clause: "ssn <> '333333333'", Enforced: true},
+		{Name: "check5", Clause: "ssn <> '555555555'", Enforced: true},
+	}
+	tableChecks2.CreateStatement = tableChecks2.GeneratedCreateStatement(flavor)
+	td = NewAlterTable(&tableChecks, &tableChecks2)
+	modsStrict := StatementModifiers{Flavor: flavor, StrictCheckOrder: true}
+	if len(td.alterClauses) != 4 {
+		t.Errorf("Expected 4 alterClauses, instead found %d", len(td.alterClauses))
+	}
+	for n, alterClause := range td.alterClauses {
+		str, strStrict := alterClause.Clause(mods), alterClause.Clause(modsStrict)
+		if str != "" || strStrict == "" {
+			t.Errorf("Clauses don't match expectations: %q / %q", str, strStrict)
+		}
+		if n%2 == 0 {
+			if _, ok := alterClause.(DropCheck); !ok {
+				t.Errorf("Unexpected type at clause[%d]: %T", n, alterClause)
+			}
+		} else {
+			if _, ok := alterClause.(AddCheck); !ok {
+				t.Errorf("Unexpected type at clause[%d]: %T", n, alterClause)
+			}
+		}
+	}
+}
+
+// TestAlterCheckConstraints provides integration test coverage relating to
+// diffs of check constraints. It is similar to the above function, but actually
+// executes the generated ALTERs to confirm validity.
+func (s TengoIntegrationSuite) TestAlterCheckConstraints(t *testing.T) {
+	flavor := s.d.Flavor()
+	if !flavor.HasCheckConstraints() {
+		t.Skipf("Check constraints not supported in flavor %s", flavor)
+	}
+
+	db, err := s.d.ConnectionPool("testing", "")
+	if err != nil {
+		t.Fatalf("Unable to establish connection pool: %v", err)
+	}
+	execAlter := func(td *TableDiff) {
+		t.Helper()
+		if td == nil {
+			t.Fatal("diff was unexpectedly nil")
+		} else if td.Type != DiffTypeAlter {
+			t.Fatalf("Expected Type to be DiffTypeAlter, instead found %s", td.Type)
+		}
+		stmt, err := td.Statement(StatementModifiers{Flavor: flavor})
+		if err != nil {
+			t.Fatalf("Unexpected error from Statement: %v", err)
+		} else if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("Unexpected error executing statement %q: %v", stmt, err)
+		}
+	}
+
+	// Test addition of checks
+	tableNoChecks := s.GetTable(t, "testing", "grab_bag")
+	tableChecks := s.GetTable(t, "testing", "grab_bag")
+	tableChecks.Checks = []*Check{
+		{Name: "alivecheck", Clause: "alive != 0", Enforced: true},
+		{Name: "stringythings", Clause: "code != 'ABCD1234' AND name != code", Enforced: true},
+	}
+	tableChecks.CreateStatement = tableChecks.GeneratedCreateStatement(flavor)
+	td := NewAlterTable(tableNoChecks, tableChecks)
+	execAlter(td)
+	tableChecks = s.GetTable(t, "testing", "grab_bag")
+	if tableChecks.UnsupportedDDL {
+		t.Fatal("Table is unexpectedly unsupported for diffs now")
+	}
+
+	// Confirm that modifying a check's name or clause = drop and re-add
+	tableChecks2 := s.GetTable(t, "testing", "grab_bag")
+	tableChecks2.Checks[0].Clause = "alive = 1"
+	tableChecks2.Checks[1].Name = "stringycheck"
+	tableChecks2.CreateStatement = tableChecks2.GeneratedCreateStatement(flavor)
+	td = NewAlterTable(tableChecks, tableChecks2)
+	if len(td.alterClauses) != 4 {
+		t.Errorf("Expected 4 alterClauses, instead found %d", len(td.alterClauses))
+	}
+	execAlter(td)
+	tableChecks = s.GetTable(t, "testing", "grab_bag")
+	if tableChecks.UnsupportedDDL {
+		t.Fatal("Table is unexpectedly unsupported for diffs now")
+	}
+	if len(tableChecks.Checks) != 2 {
+		t.Errorf("Expected 2 check constraints, instead found %d", len(tableChecks.Checks))
+	}
+
+	// Confirm functionality related to MySQL's ALTER CHECK clause and the NOT
+	// ENFORCED modifier
+	if flavor.Vendor != VendorMariaDB {
+		tableChecks2 = s.GetTable(t, "testing", "grab_bag")
+		tableChecks2.Checks[1].Enforced = false
+		tableChecks2.CreateStatement = tableChecks2.GeneratedCreateStatement(flavor)
+		td = NewAlterTable(tableChecks, tableChecks2)
+		if len(td.alterClauses) != 1 {
+			t.Errorf("Expected 1 alterClause, instead found %d", len(td.alterClauses))
+		}
+		execAlter(td)
+		tableChecks2 = s.GetTable(t, "testing", "grab_bag")
+		if tableChecks2.UnsupportedDDL {
+			t.Fatal("Table is unexpectedly unsupported for diffs now")
+		}
+		if tableChecks2.Checks[0].Enforced == tableChecks2.Checks[1].Enforced {
+			t.Error("Altering enforcement of check did not work as expected")
+		}
+
+		// Now do the reverse: set the check back to enforced
+		td = NewAlterTable(tableChecks2, tableChecks)
+		execAlter(td)
+		tableChecks = s.GetTable(t, "testing", "grab_bag")
+		if tableChecks.UnsupportedDDL {
+			t.Fatal("Table is unexpectedly unsupported for diffs now")
+		}
+		if !tableChecks.Checks[0].Enforced || !tableChecks.Checks[1].Enforced {
+			t.Error("Altering enforcement of check did not work as expected")
+		}
 	}
 }

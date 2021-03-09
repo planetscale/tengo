@@ -79,13 +79,17 @@ func (idx *Index) EqualsIgnoringVisibility(other *Index) bool {
 	return idx.Name == other.Name && idx.Comment == other.Comment && idx.Equivalent(other)
 }
 
-// OnlyVisibilityDiffers returns true if idx and other have different values
-// for Invisible, but otherwise are equal.
-func (idx *Index) OnlyVisibilityDiffers(other *Index) bool {
-	if idx == nil || other == nil {
+// sameParts returns true if two Indexes' Parts slices are identical.
+func (idx *Index) sameParts(other *Index) bool {
+	if len(idx.Parts) != len(other.Parts) {
 		return false
 	}
-	return idx.Invisible != other.Invisible && idx.EqualsIgnoringVisibility(other)
+	for n := range idx.Parts {
+		if idx.Parts[n] != other.Parts[n] {
+			return false
+		}
+	}
+	return true
 }
 
 // Equivalent returns true if two Indexes are functionally equivalent,
@@ -98,23 +102,17 @@ func (idx *Index) Equivalent(other *Index) bool {
 	if idx.PrimaryKey != other.PrimaryKey || idx.Unique != other.Unique || idx.Type != other.Type || idx.FullTextParser != other.FullTextParser {
 		return false
 	}
-	if len(idx.Parts) != len(other.Parts) {
-		return false
-	}
-	for n := range idx.Parts {
-		if idx.Parts[n] != other.Parts[n] {
-			return false
-		}
-	}
-	return true
+	return idx.sameParts(other)
 }
 
 // RedundantTo returns true if idx is equivalent to, or a strict subset of,
 // other. Both idx and other should be indexes of the same table.
-// Uniqueness and sub-parts are accounted for in the logic; for example, a
-// unique index is not considered redundant with a non-unique index having
-// the same or more cols. A primary key is never redundant, although another
-// unique index may be redundant to the primary key.
+// A non-unique index is considered redundant to any other index having the
+// same (or more) columns in the same order, unless its parts have a greater
+// column prefix length. A unique index can only be redundant to the primary key
+// or an exactly equivalent unique index; another unique index with more cols
+// may coexist due to the desired constraint semantics. A primary key is never
+// redundant to another index.
 func (idx *Index) RedundantTo(other *Index) bool {
 	if idx == nil || other == nil {
 		return false
@@ -125,7 +123,11 @@ func (idx *Index) RedundantTo(other *Index) bool {
 	if !idx.Invisible && other.Invisible {
 		return false // a visible index is never redundant to an invisible one
 	}
-	if idx.Type == "FULLTEXT" && len(idx.Parts) != len(other.Parts) {
+	if idx.Unique && other.Unique {
+		// Since unique indexes are also unique *constraints*, two unique indexes are
+		// non-redundant unless they have identical parts.
+		return idx.sameParts(other)
+	} else if idx.Type == "FULLTEXT" && len(idx.Parts) != len(other.Parts) {
 		return false // FT composite indexes don't behave like BTREE in terms of left-right prefixing
 	} else if len(idx.Parts) > len(other.Parts) {
 		return false // can't be redundant to an index with fewer cols

@@ -28,7 +28,7 @@ func TestNewInstance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Unexpectedly received error %s from NewInstance(\"mysql\", \"%s\")", err, dsn)
 		}
-		expectedInstance.RWMutex = instance.RWMutex // cheat to satisfy DeepEqual
+		expectedInstance.m = instance.m // cheat to satisfy DeepEqual
 		if !reflect.DeepEqual(expectedInstance, *instance) {
 			t.Errorf("NewInstance(\"mysql\", \"%s\"): Returned instance %#v does not match expected instance %#v", dsn, *instance, expectedInstance)
 		}
@@ -78,6 +78,7 @@ func TestNewInstance(t *testing.T) {
 
 func TestInstanceBuildParamString(t *testing.T) {
 	assertParamString := func(defaultOptions, addOptions, expectOptions string) {
+		t.Helper()
 		dsn := "username:password@tcp(1.2.3.4:3306)/"
 		if defaultOptions != "" {
 			dsn += "?" + defaultOptions
@@ -109,6 +110,40 @@ func TestInstanceBuildParamString(t *testing.T) {
 	assertParamString("param1=value1", "param1=hello", "param1=hello")
 	assertParamString("param1=value1&readTimeout=5s&interpolateParams=0", "param2=value2", "param1=value1&readTimeout=5s&interpolateParams=0&param2=value2")
 	assertParamString("param1=value1&readTimeout=5s&interpolateParams=0", "param1=value3", "param1=value3&readTimeout=5s&interpolateParams=0")
+}
+
+func TestInstanceIntrospectionParams(t *testing.T) {
+	instance, err := NewInstance("mysql", "username:password@tcp(1.2.3.4:3306)/")
+	instance.valid = true // prevent calls like Flavor() from actually attempting a conn
+	if err != nil {
+		t.Fatalf("NewInstance returned unexpected error: %v", err)
+	}
+	assertParams := func(flavor Flavor, sqlMode, expectOptions string) {
+		t.Helper()
+		instance.flavor = flavor
+		instance.sqlMode = strings.Split(sqlMode, ",")
+
+		// can't compare strings directly since order may be different
+		result := instance.introspectionParams()
+		parsedResult, err := url.ParseQuery(result)
+		if err != nil {
+			t.Fatalf("url.ParseQuery(\"%s\") returned error: %s", result, err)
+		}
+		parsedExpected, err := url.ParseQuery(expectOptions)
+		if err != nil {
+			t.Fatalf("url.ParseQuery(\"%s\") returned error: %s", expectOptions, err)
+		}
+		if !reflect.DeepEqual(parsedResult, parsedExpected) {
+			t.Errorf("Expected param map %v, instead found %v", parsedExpected, parsedResult)
+		}
+	}
+	assertParams(FlavorMySQL57, "", "sql_quote_show_create=1")
+	assertParams(FlavorMySQL80, "", "sql_quote_show_create=1&information_schema_stats_expiry=0")
+	assertParams(FlavorMySQL57, "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE", "sql_quote_show_create=1")
+	assertParams(FlavorPercona80, "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE", "sql_quote_show_create=1&information_schema_stats_expiry=0")
+	assertParams(FlavorMariaDB105, "ANSI_QUOTES", "sql_quote_show_create=1&sql_mode=%27%27")
+	assertParams(FlavorMySQL57, "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI", "sql_quote_show_create=1&sql_mode=%27REAL_AS_FLOAT%2CPIPES_AS_CONCAT%2CIGNORE_SPACE%2CONLY_FULL_GROUP_BY%27")
+	assertParams(FlavorMySQL80, "NO_FIELD_OPTIONS,NO_BACKSLASH_ESCAPES,NO_KEY_OPTIONS,NO_TABLE_OPTIONS", "sql_quote_show_create=1&information_schema_stats_expiry=0&sql_mode=%27NO_BACKSLASH_ESCAPES%27")
 }
 
 func (s TengoIntegrationSuite) TestInstanceConnect(t *testing.T) {
@@ -164,6 +199,9 @@ func (s TengoIntegrationSuite) TestInstanceCanConnect(t *testing.T) {
 	if ok, err := inst.CanConnect(); !ok || err != nil {
 		t.Fatalf("Unexpected return from CanConnect(): %t / %s", ok, err)
 	}
+	if ok, err := inst.Valid(); !ok || err != nil {
+		t.Fatalf("Unexpected return from Valid(): %t / %s", ok, err)
+	}
 
 	// Stop the DockerizedInstance and confirm CanConnect result matches
 	// expectation
@@ -171,6 +209,7 @@ func (s TengoIntegrationSuite) TestInstanceCanConnect(t *testing.T) {
 		t.Fatalf("Failed to Stop instance: %s", err)
 	}
 	ok, connErr := inst.CanConnect()
+	valid, validErr := inst.Valid()
 	if err := s.d.Start(); err != nil {
 		t.Fatalf("Failed to re-Start() instance: %s", err)
 	}
@@ -178,7 +217,33 @@ func (s TengoIntegrationSuite) TestInstanceCanConnect(t *testing.T) {
 		t.Fatalf("Failed to reconnect after restarting instance: %s", err)
 	}
 	if ok || connErr == nil {
-		t.Errorf("Unexpected return from CanConnect(): %t / %s", ok, connErr)
+		t.Errorf("Unexpected return from TryConnect(): %t / %s", ok, connErr)
+	}
+	if !valid || validErr != nil { // Instance is still considered Valid since it was reachable earlier
+		t.Errorf("Unexpected return from Valid(): %t / %s", ok, connErr)
+	}
+}
+
+func (s TengoIntegrationSuite) TestInstanceValid(t *testing.T) {
+	if ok, err := s.d.Valid(); !ok || err != nil {
+		t.Fatalf("Valid() unexpectedly returned %t / %v", ok, err)
+	}
+
+	dsn := s.d.DSN()
+	dsn = strings.Replace(dsn, s.d.Password, "wrongpass", 1)
+	inst, err := NewInstance("mysql", dsn)
+	if err != nil {
+		t.Fatalf("Unexpected error from NewInstance: %s", err)
+	}
+	if ok, err := inst.Valid(); ok || err == nil {
+		t.Fatalf("Valid() unexpectedly returned %t / %v despite wrong password", ok, err)
+	}
+	inst, err = NewInstance("mysql", s.d.DSN())
+	if err != nil {
+		t.Fatalf("Unexpected error from NewInstance: %s", err)
+	}
+	if ok, err := inst.Valid(); !ok || err != nil {
+		t.Fatalf("Valid() unexpectedly returned %t / %v", ok, err)
 	}
 }
 
@@ -247,8 +312,9 @@ func (s TengoIntegrationSuite) TestInstanceFlavorVersion(t *testing.T) {
 	if expected == FlavorUnknown {
 		t.Skip("SKIPPING TEST - no image map defined for", s.d.Image)
 	}
-	if actualFlavor := s.d.Flavor().Family(); actualFlavor != expected {
-		t.Errorf("Expected image=%s to yield flavor=%s, instead found %s", s.d.Image, expected, actualFlavor)
+	actualFlavor := s.d.Flavor()
+	if actualFlavor.Family() != expected {
+		t.Errorf("Expected image=%s to yield flavor=%s, instead found %s", s.d.Image, expected, actualFlavor.Family())
 	}
 	if actualMajor, actualMinor, _ := s.d.Version(); actualMajor != expected.Major || actualMinor != expected.Minor {
 		t.Errorf("Expected image=%s to yield major=%d minor=%d, instead found major=%d minor=%d", s.d.Image, expected.Major, expected.Minor, actualMajor, actualMinor)
@@ -264,7 +330,7 @@ func (s TengoIntegrationSuite) TestInstanceFlavorVersion(t *testing.T) {
 	if err := s.d.SetFlavor(expected); err != nil || s.d.Flavor() != expected {
 		t.Errorf("Unexpected outcome from SetFlavor: error=%v, flavor=%s", err, s.d.Flavor())
 	}
-	s.d.ForceFlavor(FlavorUnknown) // Clean up
+	s.d.ForceFlavor(actualFlavor)
 }
 
 func (s TengoIntegrationSuite) TestInstanceCanSkipBinlog(t *testing.T) {
@@ -320,6 +386,18 @@ func (s TengoIntegrationSuite) TestInstanceCanSkipBinlog(t *testing.T) {
 }
 
 func (s TengoIntegrationSuite) TestInstanceSchemas(t *testing.T) {
+	assertSame := func(s1, s2 *Schema) {
+		t.Helper()
+		if s1.Name != s2.Name {
+			t.Errorf("Schema names do not match: %q vs %q", s1.Name, s2.Name)
+		} else {
+			diff := s1.Diff(s2)
+			if diffCount := len(diff.ObjectDiffs()); diffCount > 0 {
+				t.Errorf("Schemas do not match: %d object diffs found", diffCount)
+			}
+		}
+	}
+
 	// Currently at least 4 schemas in testdata/integration.sql
 	schemas, err := s.d.Schemas()
 	if err != nil || len(schemas) < 4 {
@@ -339,14 +417,14 @@ func (s TengoIntegrationSuite) TestInstanceSchemas(t *testing.T) {
 			t.Errorf("Schema %s returned multiple times from call to instance.Schemas", schema.Name)
 		}
 		seen[schema.Name] = true
-		if !reflect.DeepEqual(schema, byName[schema.Name]) {
-			t.Errorf("Mismatch for schema %s between Schemas and SchemasByName", schema.Name)
-		}
-		if schema2, err := s.d.Schema(schema.Name); err != nil || !reflect.DeepEqual(schema2, schema) {
-			t.Errorf("Mismatch for schema %s vs instance.Schema(%s); error=%s", schema.Name, schema.Name, err)
+		assertSame(schema, byName[schema.Name])
+		if schema2, err := s.d.Schema(schema.Name); err != nil {
+			t.Errorf("Unexpected error from Schema(%q): %v", schema.Name, err)
+		} else {
+			assertSame(schema, schema2)
 		}
 		if has, err := s.d.HasSchema(schema.Name); !has || err != nil {
-			t.Errorf("Expected HasSchema(%s)==true, instead found false", schema.Name)
+			t.Errorf("Expected HasSchema(%s)==true, instead found false / %v", schema.Name, err)
 		}
 	}
 
@@ -616,353 +694,6 @@ func (s TengoIntegrationSuite) TestInstanceAlterSchema(t *testing.T) {
 	assertNoError("testing", "utf8mb4", "utf8mb4_general_ci", "utf8mb4", "utf8mb4_general_ci")
 }
 
-func (s TengoIntegrationSuite) TestInstanceSchemaIntrospection(t *testing.T) {
-	// Ensure our unit test fixtures and integration test fixtures match
-	flavor := s.d.Flavor()
-	schema, aTableFromDB := s.GetSchemaAndTable(t, "testing", "actor")
-	aTableFromUnit := aTableForFlavor(flavor, 1)
-	aTableFromUnit.CreateStatement = "" // Prevent diff from short-circuiting on equivalent CREATEs
-	clauses, supported := aTableFromDB.Diff(&aTableFromUnit)
-	if !supported {
-		t.Error("Diff unexpectedly not supported for testing.actor")
-	} else if len(clauses) > 0 {
-		t.Errorf("Diff of testing.actor unexpectedly found %d clauses; expected 0. Clauses: %+v", len(clauses), clauses)
-	}
-
-	aTableFromDB = s.GetTable(t, "testing", "actor_in_film")
-	aTableFromUnit = anotherTableForFlavor(flavor)
-	aTableFromUnit.CreateStatement = "" // Prevent diff from short-circuiting on equivalent CREATEs
-	clauses, supported = aTableFromDB.Diff(&aTableFromUnit)
-	if !supported {
-		t.Error("Diff unexpectedly not supported for testing.actor_in_film")
-	} else if len(clauses) > 0 {
-		t.Errorf("Diff of testing.actor_in_film unexpectedly found %d clauses; expected 0", len(clauses))
-	}
-
-	// ensure tables in testing schema are all supported (except where known not to be)
-	for _, table := range schema.Tables {
-		shouldBeUnsupported := (table.Name == unsupportedTable().Name)
-		if table.UnsupportedDDL != shouldBeUnsupported {
-			t.Errorf("Table %s: expected UnsupportedDDL==%v, instead found %v\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", table.Name, shouldBeUnsupported, !shouldBeUnsupported, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-	}
-
-	// Test ObjectDefinitions map, which should contain objects of multiple types
-	dict := schema.ObjectDefinitions()
-	for key, create := range dict {
-		var ok bool
-		switch key.Type {
-		case ObjectTypeTable:
-			ok = strings.HasPrefix(create, "CREATE TABLE")
-		case ObjectTypeProc, ObjectTypeFunc:
-			ok = strings.HasPrefix(create, "CREATE DEFINER")
-		}
-		if !ok {
-			t.Errorf("Unexpected or incorrect key %s found in schema object definitions --> %s", key, create)
-		}
-	}
-
-	if dict[ObjectKey{Type: ObjectTypeFunc, Name: "func1"}] == "" || dict[ObjectKey{Type: ObjectTypeProc, Name: "func1"}] != "" {
-		t.Error("ObjectDefinitions map not populated as expected")
-	}
-
-	// ensure character set handling works properly regardless of whether this
-	// flavor has a data dictionary, which changed many SHOW CREATE TABLE behaviors
-	schema = s.GetSchema(t, "testcharcoll")
-	for _, table := range schema.Tables {
-		if table.UnsupportedDDL {
-			t.Errorf("Table %s unexpectedly not supported for diff.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", table.Name, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-	}
-
-	// Test various flavor-specific ordering fixes
-	aTableFromDB = s.GetTable(t, "testing", "grab_bag")
-	if aTableFromDB.UnsupportedDDL {
-		t.Error("Cannot test various order-fixups because testing.grab_bag is unexpectedly not supported for diff")
-	} else {
-		// Test index order correction, even if no test image is using new data dict
-		aTableFromDB.SecondaryIndexes[0], aTableFromDB.SecondaryIndexes[1], aTableFromDB.SecondaryIndexes[2] = aTableFromDB.SecondaryIndexes[2], aTableFromDB.SecondaryIndexes[0], aTableFromDB.SecondaryIndexes[1]
-		fixIndexOrder(aTableFromDB)
-		if aTableFromDB.GeneratedCreateStatement(flavor) != aTableFromDB.CreateStatement {
-			t.Error("fixIndexOrder did not behave as expected")
-		}
-
-		// Test foreign key order correction, even if no test image lacks sorted FKs
-		aTableFromDB.ForeignKeys[0], aTableFromDB.ForeignKeys[1], aTableFromDB.ForeignKeys[2] = aTableFromDB.ForeignKeys[2], aTableFromDB.ForeignKeys[0], aTableFromDB.ForeignKeys[1]
-		fixForeignKeyOrder(aTableFromDB)
-		if aTableFromDB.GeneratedCreateStatement(flavor) != aTableFromDB.CreateStatement {
-			t.Error("fixForeignKeyOrder did not behave as expected")
-		}
-
-		// Test create option order correction, even if no test image is using new data dict
-		aTableFromDB.CreateOptions = "ROW_FORMAT=COMPACT DELAY_KEY_WRITE=1 CHECKSUM=1"
-		fixCreateOptionsOrder(aTableFromDB, flavor)
-		if aTableFromDB.GeneratedCreateStatement(flavor) != aTableFromDB.CreateStatement {
-			t.Error("fixCreateOptionsOrder did not behave as expected")
-		}
-	}
-
-	// Test introspection of default expressions, if flavor supports them
-	hasDefaultExpressions := flavor.VendorMinVersion(VendorMariaDB, 10, 2)
-	if flavor.MySQLishMinVersion(8, 0) {
-		if _, _, patch := s.d.Version(); patch >= 13 { // 8.0.13 added default expressions
-			hasDefaultExpressions = true
-		}
-	}
-	if hasDefaultExpressions {
-		db, err := s.d.Connect("testing", "")
-		if err != nil {
-			t.Fatalf("Unexpected error from connect: %s", err)
-		}
-		if _, err := db.Exec("ALTER TABLE grab_bag ADD COLUMN expiration DATE DEFAULT (CURRENT_DATE + INTERVAL 1 YEAR)"); err != nil {
-			t.Fatalf("Unexpected error from ALTER: %s", err)
-		}
-		table := s.GetTable(t, "testing", "grab_bag")
-		if table.UnsupportedDDL {
-			t.Error("Use of default expression unexpectedly triggers UnsupportedDDL")
-		}
-	}
-
-	// Test introspection of generated columns, if flavor supports them
-	if flavor.GeneratedColumns() {
-		sqlfile := "testdata/generatedcols.sql"
-		if flavor.Vendor == VendorMariaDB { // no support for NOT NULL generated cols
-			sqlfile = "testdata/generatedcols-maria.sql"
-		}
-		if _, err := s.d.SourceSQL(sqlfile); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/generatedcols.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "staff")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using generated columns to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		// Test generation expression fix, even if test image isn't MySQL 8
-		for _, col := range table.Columns {
-			if col.GenerationExpr != "" {
-				col.GenerationExpr = "length(_latin1\\'fixme\\')"
-			}
-		}
-		fixGenerationExpr(table, flavor)
-		if table.GeneratedCreateStatement(flavor) != table.CreateStatement {
-			t.Error("fixGenerationExpr did not behave as expected")
-		}
-	}
-
-	// Test advanced index functionality in MySQL 8+
-	if flavor.MySQLishMinVersion(8, 0) {
-		if _, err := s.d.SourceSQL("testdata/index-mysql8.sql"); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/index-mysql8.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "my8idx")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using advanced index functionality to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		idx := table.SecondaryIndexes[0]
-		if !idx.Invisible {
-			t.Errorf("Expected index %s to be invisible, but it was not", idx.Name)
-		}
-		if idx.Parts[0].Descending || !idx.Parts[1].Descending {
-			t.Errorf("Unexpected index part collations found: [0].Descending=%t, [1].Descending=%t", idx.Parts[0].Descending, !idx.Parts[1].Descending)
-		}
-		if idx.Parts[0].Expression != "" || idx.Parts[1].Expression == "" {
-			t.Errorf("Unexpected index part expressions found: [0].Expression=%q, [1].Expression=%q", idx.Parts[0].Expression, idx.Parts[1].Expression)
-		}
-	}
-
-	// Test invisible column support in MariaDB 10.3+
-	if flavor.VendorMinVersion(VendorMariaDB, 10, 3) {
-		if _, err := s.d.SourceSQL("testdata/inviscols-maria.sql"); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/inviscols-maria.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "invistest")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using invisible columns to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		for n, col := range table.Columns {
-			expectInvis := (n == 0 || n == 4)
-			if col.Invisible != expectInvis {
-				t.Errorf("Expected Columns[%d].Invisible == %t, instead found %t", n, expectInvis, !expectInvis)
-			}
-		}
-	}
-
-	// Include coverage for fulltext parsers if MySQL 5.7+. (Although these are
-	// supported in other flavors too, no alternative parsers ship with them.)
-	if flavor.MySQLishMinVersion(5, 7) {
-		if _, err := s.d.SourceSQL("testdata/ft-parser.sql"); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/ft-parser.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "ftparser")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using ngram fulltext parser to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		indexes := table.SecondaryIndexesByName()
-		if idx := indexes["ftdesc"]; idx.FullTextParser != "ngram" || idx.Type != "FULLTEXT" {
-			t.Errorf("Expected index %s to be FULLTEXT with ngram parser, instead found type=%s / parser=%s", idx.Name, idx.Type, idx.FullTextParser)
-		}
-		if idx := indexes["ftbody"]; idx.FullTextParser != "" || idx.Type != "FULLTEXT" {
-			t.Errorf("Expected index %s to be FULLTEXT with no parser, instead found type=%s / parser=%s", idx.Name, idx.Type, idx.FullTextParser)
-		}
-		if idx := indexes["name"]; idx.FullTextParser != "" || idx.Type != "BTREE" {
-			t.Errorf("Expected index %s to be BTREE with no parser, instead found type=%s / parser=%s", idx.Name, idx.Type, idx.FullTextParser)
-		}
-	}
-
-	// Coverage for column compression
-	if flavor.VendorMinVersion(VendorPercona, 5, 6, 33) {
-		if _, err := s.d.SourceSQL("testdata/colcompression-percona.sql"); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/colcompression-percona.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "colcompr")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using column compression to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		if table.Columns[1].Compression != "COMPRESSED" {
-			t.Errorf("Unexpected value for compression column attribute: found %q", table.Columns[1].Compression)
-		}
-	} else if flavor.VendorMinVersion(VendorMariaDB, 10, 3) {
-		if _, err := s.d.SourceSQL("testdata/colcompression-maria.sql"); err != nil {
-			t.Fatalf("Unexpected error sourcing testdata/colcompression-maria.sql: %v", err)
-		}
-		table := s.GetTable(t, "testing", "colcompr")
-		if table.UnsupportedDDL {
-			t.Errorf("Expected table using column compression to be supported for diff in flavor %s, but it was not.\nExpected SHOW CREATE TABLE:\n%s\nActual SHOW CREATE TABLE:\n%s", flavor, table.GeneratedCreateStatement(flavor), table.CreateStatement)
-		}
-		if table.Columns[1].Compression != "COMPRESSED" {
-			t.Errorf("Unexpected value for compression column attribute: found %q", table.Columns[1].Compression)
-		}
-	}
-}
-
-func (s TengoIntegrationSuite) TestInstanceRoutineIntrospection(t *testing.T) {
-	schema := s.GetSchema(t, "testing")
-	db, err := s.d.Connect("testing", "")
-	if err != nil {
-		t.Fatalf("Unexpected error from Connect: %s", err)
-	}
-	var sqlMode string
-	if err = db.QueryRow("SELECT @@sql_mode").Scan(&sqlMode); err != nil {
-		t.Fatalf("Unexpected error from Scan: %s", err)
-	}
-
-	procsByName := schema.ProceduresByName()
-	actualProc1 := procsByName["proc1"]
-	if actualProc1 == nil || len(procsByName) != 1 {
-		t.Fatal("Unexpected result from ProceduresByName()")
-	}
-	expectProc1 := aProc(schema.Collation, sqlMode)
-	if !expectProc1.Equals(actualProc1) {
-		t.Errorf("Actual proc did not equal expected.\nACTUAL: %+v\nEXPECTED: %+v\n", actualProc1, &expectProc1)
-	}
-
-	funcsByName := schema.FunctionsByName()
-	actualFunc1 := funcsByName["func1"]
-	if actualFunc1 == nil || len(funcsByName) != 2 {
-		t.Fatal("Unexpected result from FunctionsByName()")
-	}
-	expectFunc1 := aFunc(schema.Collation, sqlMode)
-	if !expectFunc1.Equals(actualFunc1) {
-		t.Errorf("Actual func did not equal expected.\nACTUAL: %+v\nEXPECTED: %+v\n", actualFunc1, &expectFunc1)
-	}
-	if actualFunc1.Equals(actualProc1) {
-		t.Error("Equals not behaving as expected, proc1 and func1 should not be equal")
-	}
-
-	// If this flavor supports using mysql.proc to bulk-fetch routines, confirm
-	// the result is identical to using the individual SHOW CREATE queries
-	if !s.d.Flavor().HasDataDictionary() {
-		fastResults, err := s.d.querySchemaRoutines("testing")
-		if err != nil {
-			t.Fatalf("Unexpected error from querySchemaRoutines: %s", err)
-		}
-		oldFlavor := s.d.Flavor()
-		s.d.ForceFlavor(FlavorMySQL80)
-		slowResults, err := s.d.querySchemaRoutines("testing")
-		s.d.ForceFlavor(oldFlavor)
-		if err != nil {
-			t.Fatalf("Unexpected error from querySchemaRoutines: %s", err)
-		}
-		for n, r := range fastResults {
-			if !r.Equals(slowResults[n]) {
-				t.Errorf("Routine[%d] mismatch\nFast path value: %+v\nSlow path value: %+v\n", n, r, slowResults[n])
-			}
-		}
-	}
-
-	// Coverage for various nil cases and error conditions
-	schema = nil
-	if procCount := len(schema.ProceduresByName()); procCount != 0 {
-		t.Errorf("nil schema unexpectedly contains %d procedures by name", procCount)
-	}
-	var r *Routine
-	if actualFunc1.Equals(r) || !r.Equals(r) {
-		t.Error("Equals not behaving as expected")
-	}
-	if _, err = showCreateRoutine(db, actualProc1.Name, ObjectTypeFunc); err != sql.ErrNoRows {
-		t.Errorf("Unexpected error return from showCreateRoutine: expected sql.ErrNoRows, found %s", err)
-	}
-	if _, err = showCreateRoutine(db, actualFunc1.Name, ObjectTypeProc); err != sql.ErrNoRows {
-		t.Errorf("Unexpected error return from showCreateRoutine: expected sql.ErrNoRows, found %s", err)
-	}
-	if _, err = showCreateRoutine(db, actualFunc1.Name, ObjectTypeTable); err == nil {
-		t.Error("Expected non-nil error return from showCreateRoutine with invalid type, instead found nil")
-	}
-}
-
-func (s TengoIntegrationSuite) TestInstanceStrictModeCompliant(t *testing.T) {
-	assertCompliance := func(expected bool) {
-		t.Helper()
-		schemas, err := s.d.Schemas()
-		if err != nil {
-			t.Fatalf("Unexpected error from Schemas: %s", err)
-		}
-		compliant, err := s.d.StrictModeCompliant(schemas)
-		if err != nil {
-			t.Fatalf("Unexpected error from StrictModeCompliant: %s", err)
-		}
-		if compliant != expected {
-			t.Errorf("Unexpected result from StrictModeCompliant: found %t", compliant)
-		}
-	}
-	db, err := s.d.Connect("testing", "innodb_strict_mode=0&sql_mode=%27NO_ENGINE_SUBSTITUTION%27")
-	if err != nil {
-		t.Fatalf("Unexpected error from connect: %s", err)
-	}
-	exec := func(statement string) {
-		t.Helper()
-		if _, err := db.Exec(statement); err != nil {
-			t.Fatalf("Unexpected error from Exec: %s", err)
-		}
-	}
-
-	// Default setup in integration.sql is expected to be compliant, except in 5.5
-	// due to use of zero default dates there only
-	major, minor, _ := s.d.Version()
-	expect := (major != 5 || minor != 5)
-	assertCompliance(expect)
-
-	if expect {
-		// A table with a zero-date default should break compliance
-		exec("CREATE TABLE has_zero_date (day date NOT NULL DEFAULT '0000-00-00')")
-		assertCompliance(false)
-		exec("DROP TABLE has_zero_date")
-	} else {
-		// 5.5 should become compliant if we drop the table with a zero-date default
-		exec("DROP TABLE grab_bag")
-		assertCompliance(true)
-	}
-
-	// Create tables with ROW_FORMAT=COMPRESSED. This should break compliance in
-	// MySQL/Percona 5.5-5.6 and MariaDB 10.1, due to their default globals.
-	exec("CREATE TABLE comprtest1 (name varchar(30)) ROW_FORMAT=COMPRESSED")
-	exec("CREATE TABLE comprtest2 (name varchar(30)) ROW_FORMAT=COMPRESSED")
-	expect = true
-	if (major == 5 && minor <= 6) || s.d.Flavor().Family() == FlavorMariaDB101 {
-		expect = false
-	}
-	assertCompliance(expect)
-}
-
 // TestColumnCompression confirms that various logic around compressed columns
 // in Percona Server and MariaDB work properly. The syntax and functionality
 // differs between these two vendors, and meanwhile MySQL has no equivalent
@@ -1023,5 +754,28 @@ func TestFixFulltextIndexParsers(t *testing.T) {
 	fixFulltextIndexParsers(&table, FlavorMySQL57)
 	if table.SecondaryIndexes[0].FullTextParser != "ngram" {
 		t.Errorf("fixFulltextIndexParsers unexpectedly set parser to %q instead of %q", table.SecondaryIndexes[0].FullTextParser, "ngram")
+	}
+}
+
+// TestFixBlobDefaultExpression confirms CREATE TABLE parsing works for blob/
+// text default expressions in versions which omit them from information_schema.
+func TestFixBlobDefaultExpression(t *testing.T) {
+	table := aTableForFlavor(FlavorMySQL80, 0)
+	defExpr := "(CONCAT('hello ', 'world'))"
+	table.Columns[1].Default = defExpr
+	table.CreateStatement = table.GeneratedCreateStatement(FlavorMySQL80)
+	table.Columns[1].Default = "!!!BLOBDEFAULT!!!"
+	fixBlobDefaultExpression(&table, FlavorMySQL80)
+	if table.Columns[1].Default != defExpr {
+		t.Errorf("fixBlobDefaultExpression did not work or set default to unexpected value %q", table.Columns[1].Default)
+	}
+
+	// Confirm regex still correct with stuff after the default
+	table.Columns[1].Comment = "hi i am a comment"
+	table.CreateStatement = table.GeneratedCreateStatement(FlavorMySQL80)
+	table.Columns[1].Default = "!!!BLOBDEFAULT!!!"
+	fixBlobDefaultExpression(&table, FlavorMySQL80)
+	if table.Columns[1].Default != defExpr {
+		t.Errorf("fixBlobDefaultExpression did not work after adding comment, default is unexpected value %q", table.Columns[1].Default)
 	}
 }

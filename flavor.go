@@ -259,7 +259,8 @@ func (fl Flavor) Known() bool {
 }
 
 // AllowBlobDefaults returns true if the flavor permits blob and text types
-// to have default values.
+// to have literal default values. (Note that MySQL may permit these types to
+// have default *expressions* anyway.)
 func (fl Flavor) AllowBlobDefaults() bool {
 	return fl.VendorMinVersion(VendorMariaDB, 10, 2)
 }
@@ -299,45 +300,11 @@ func (fl Flavor) AlwaysShowTableCollation(charSet string) bool {
 	return false
 }
 
-// HasInnoFileFormat returns true if the innodb_file_format variable exists in
-// the flavor, false otherwise.
-func (fl Flavor) HasInnoFileFormat() bool {
-	return !(fl.MySQLishMinVersion(8, 0) || fl.VendorMinVersion(VendorMariaDB, 10, 3))
-}
-
 // GeneratedColumns returns true if the flavor supports generated columns
 // using MySQL's native syntax. (Although MariaDB 10.1 has support for generated
 // columns, its syntax is borrowed from other DBMS, so false is returned.)
 func (fl Flavor) GeneratedColumns() bool {
 	return fl.MySQLishMinVersion(5, 7) || fl.VendorMinVersion(VendorMariaDB, 10, 2)
-}
-
-// InnoRowFormatReqs returns information on the flavor's requirements for
-// using the supplied row_format in InnoDB. If the first return value is true,
-// the flavor requires innodb_file_per_table=1. If the second return value is
-// true, the flavor requires innodb_file_format=Barracuda.
-// The format arg must be one of "DYNAMIC", "COMPRESSED", "COMPACT", or
-// "REDUNDANT" (case-insensitive), otherwise this method panics...
-func (fl Flavor) InnoRowFormatReqs(format string) (filePerTable, barracudaFormat bool) {
-	switch strings.ToUpper(format) {
-	case "DYNAMIC":
-		// DYNAMIC is always OK in MySQL/Percona 5.7+, and MariaDB 10.1 or 10.3+.
-		// Oddly, MariaDB 10.2 is more picky and requires Barracuda.
-		if fl.MySQLishMinVersion(5, 7) {
-			return false, false
-		} else if fl.VendorMinVersion(VendorMariaDB, 10, 1) {
-			return false, (fl.Major == 10 && fl.Minor == 2)
-		}
-		return true, true
-	case "COMPRESSED":
-		// COMPRESSED always requires file_per_table, and it requires Barracuda in
-		// any flavor that still has the innodb_file_format variable.
-		return true, fl.HasInnoFileFormat()
-	case "COMPACT", "REDUNDANT":
-		return false, false
-	}
-	// Panic on unexpected input, since this may be programmer error / a typo
-	panic(fmt.Errorf("Unknown row_format %s is not supported", format))
 }
 
 // SortedForeignKeys returns true if the flavor sorts foreign keys
@@ -357,4 +324,13 @@ func (fl Flavor) SortedForeignKeys() bool {
 // tinyint(1).
 func (fl Flavor) OmitIntDisplayWidth() bool {
 	return fl.MySQLishMinVersion(8, 0, 19)
+}
+
+// HasCheckConstraints returns true if the flavor supports check constraints
+// and exposes them in information_schema.
+func (fl Flavor) HasCheckConstraints() bool {
+	if fl.MySQLishMinVersion(8, 0, 16) || fl.VendorMinVersion(VendorMariaDB, 10, 3, 10) {
+		return true
+	}
+	return fl.Family() == FlavorMariaDB102 && fl.VendorMinVersion(VendorMariaDB, 10, 2, 22)
 }
